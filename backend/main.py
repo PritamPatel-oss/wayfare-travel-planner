@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Literal, Optional
 from uuid import UUID
@@ -11,27 +12,43 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from auth import create_access_token, decode_access_token, hash_password, verify_password
+from database import TripModel, UserModel, get_db, init_db
+from itinerary import generate_itinerary, regenerate_day_itinerary
 
 load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
-ORIGINS = [o.strip().rstrip("/") for o in os.getenv("FRONTEND_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
+DEFAULT_ORIGINS = "http://localhost:5173,https://wayfare-travel-planner-black.vercel.app"
+ORIGINS = [o.strip().rstrip("/") for o in os.getenv("FRONTEND_ORIGINS", DEFAULT_ORIGINS).split(",") if o.strip()]
 
-app = FastAPI(title="Wayfare API", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Ensure database tables exist on startup
+    init_db()
+    yield
+
+
+app = FastAPI(title="Wayfare API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGINS,
-    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ---------------------------------------------------------------- models
+
+
+class UserAuthRequest(BaseModel):
+    email: str
+    password: str = Field(min_length=6, max_length=128)
 
 
 class TripRequest(BaseModel):
@@ -68,37 +85,52 @@ class TripUpdate(BaseModel):
 # ---------------------------------------------------------------- auth
 
 
-async def current_user(authorization: str = Header(default="")) -> dict:
-    """Validate the Supabase access token and return the user id + token."""
+async def current_user(
+    authorization: str = Header(default=""),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Validate the JWT bearer token and return the authenticated user dict."""
     if not authorization.startswith("Bearer "):
         raise HTTPException(401, "Please sign in to continue.")
-    if not SUPABASE_URL:
-        raise HTTPException(500, "Server is missing SUPABASE_URL.")
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                f"{SUPABASE_URL}/auth/v1/user",
-                headers={"Authorization": authorization, "apikey": SUPABASE_ANON_KEY},
-            )
-    except httpx.RequestError:
-        raise HTTPException(502, "Cannot reach Supabase authentication service. Please check SUPABASE_URL.")
-    if r.status_code != 200:
+    token = authorization.split(" ", 1)[1]
+    payload = decode_access_token(token)
+    if not payload or not payload.get("sub"):
         raise HTTPException(401, "Your session has expired. Please sign in again.")
-    return {"id": r.json()["id"], "token": authorization.split(" ", 1)[1]}
+    user = db.query(UserModel).filter(UserModel.id == payload["sub"]).first()
+    if not user:
+        raise HTTPException(401, "Account not found. Please sign in again.")
+    return {"id": user.id, "email": user.email, "token": token}
 
 
-def rest_headers(user: dict) -> dict:
-    # Using the user's own JWT means Supabase Row Level Security protects every row.
-    return {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {user['token']}",
-        "Content-Type": "application/json",
-        "Prefer": "return=representation",
-    }
+@app.post("/api/auth/signup", status_code=201)
+def signup(req: UserAuthRequest, db: Session = Depends(get_db)):
+    email = req.email.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(400, "Please provide a valid email address.")
+    existing = db.query(UserModel).filter(UserModel.email == email).first()
+    if existing:
+        raise HTTPException(400, "An account with this email already exists.")
+    user = UserModel(email=email, hashed_password=hash_password(req.password))
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    token = create_access_token({"sub": user.id, "email": user.email})
+    return {"access_token": token, "token_type": "bearer", "user": {"id": user.id, "email": user.email}}
 
 
-def rest(path: str) -> str:
-    return f"{SUPABASE_URL}/rest/v1/{path}"
+@app.post("/api/auth/signin")
+def signin(req: UserAuthRequest, db: Session = Depends(get_db)):
+    email = req.email.strip().lower()
+    user = db.query(UserModel).filter(UserModel.email == email).first()
+    if not user or not verify_password(req.password, user.hashed_password):
+        raise HTTPException(401, "Invalid email or password.")
+    token = create_access_token({"sub": user.id, "email": user.email})
+    return {"access_token": token, "token_type": "bearer", "user": {"id": user.id, "email": user.email}}
+
+
+@app.get("/api/auth/me")
+def get_me(user: dict = Depends(current_user)):
+    return user
 
 
 # ---------------------------------------------------------------- AI
@@ -241,7 +273,7 @@ async def attach_images(destination: str, days: list[dict], cover: bool = True) 
         found = await asyncio.gather(*jobs)
     for d, img in zip(days, found):
         d["image"] = img
-    return found[-1] if cover else None
+    return found[-1] if cover and found else None
 
 
 # ---------------------------------------------------------------- routes
@@ -254,16 +286,11 @@ async def health():
 
 @app.post("/api/generate")
 async def generate(req: TripRequest, user: dict = Depends(current_user)):
-    prompt = (
-        f"Plan a {req.days}-day trip.\n{prefs_text(req)}\n\n"
-        f"{RULES.format(cur=req.currency)} Return exactly {req.days} days.\n"
-        f"Return JSON shaped like: {TRIP_SHAPE}"
-    )
-    data = await groq_json(prompt)
+    data = await generate_itinerary(req)
     raw_days = data.get("days") or []
     if not raw_days:
-        raise HTTPException(502, "The AI returned an empty plan. Please try again.")
-    days = [clean_day(d, i + 1) for i, d in enumerate(raw_days[: req.days])]
+        raise HTTPException(502, "Could not build the itinerary. Please try again.")
+    days = [clean_day(d, i + 1) for i, d in enumerate(raw_days[: req.days]) if isinstance(d, dict)]
     cover = await attach_images(req.destination, days)
     return {
         "title": str(data.get("title", f"{req.days} days in {req.destination}"))[:120],
@@ -278,17 +305,10 @@ async def generate(req: TripRequest, user: dict = Depends(current_user)):
 @app.post("/api/regenerate-day")
 async def regenerate_day(req: RegenRequest, user: dict = Depends(current_user)):
     p = req.preferences
-    avoid = ", ".join(req.other_places[:40]) or "none"
-    prompt = (
-        f"Rewrite day {req.day_number} of a {p.days}-day trip.\n{prefs_text(p)}\n"
-        f"Do NOT repeat these places already used on other days: {avoid}.\n"
-        f"Change request: {req.instruction or 'Give a fresh alternative plan for this day.'}\n\n"
-        f"{RULES.format(cur=p.currency)}\nReturn JSON shaped like: {DAY_SHAPE}"
-    )
-    data = await groq_json(prompt)
+    data = await regenerate_day_itinerary(req)
     day = clean_day(data, req.day_number)
     if not day["activities"]:
-        raise HTTPException(502, "The AI returned an empty day. Please try again.")
+        raise HTTPException(502, "Could not rebuild this day. Please try again.")
     await attach_images(p.destination, [day], cover=False)
     return day
 
@@ -300,50 +320,111 @@ async def image(query: str):
 
 
 @app.post("/api/trips", status_code=201)
-async def create_trip(body: TripCreate, user: dict = Depends(current_user)):
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(rest("trips"), headers=rest_headers(user), json=body.model_dump())
-    if r.status_code >= 300:
-        raise HTTPException(502, "Could not save the trip.")
-    return r.json()[0]
+def create_trip(
+    body: TripCreate,
+    user: dict = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    trip = TripModel(
+        user_id=user["id"],
+        destination=body.destination,
+        days=body.days,
+        preferences=body.preferences,
+        itinerary=body.itinerary,
+    )
+    db.add(trip)
+    db.commit()
+    db.refresh(trip)
+    return {
+        "id": trip.id,
+        "destination": trip.destination,
+        "days": trip.days,
+        "preferences": trip.preferences,
+        "itinerary": trip.itinerary,
+        "created_at": trip.created_at.isoformat() if trip.created_at else None,
+        "updated_at": trip.updated_at.isoformat() if trip.updated_at else None,
+    }
 
 
 @app.get("/api/trips")
-async def list_trips(user: dict = Depends(current_user)):
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(
-            rest("trips"),
-            headers=rest_headers(user),
-            params={"select": "id,destination,days,created_at,updated_at,itinerary", "order": "created_at.desc"},
-        )
-    if r.status_code >= 300:
-        raise HTTPException(502, "Could not load your trips.")
-    return r.json()
+def list_trips(
+    user: dict = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    trips = (
+        db.query(TripModel)
+        .filter(TripModel.user_id == user["id"])
+        .order_by(TripModel.created_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": t.id,
+            "destination": t.destination,
+            "days": t.days,
+            "itinerary": t.itinerary,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+            "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+        }
+        for t in trips
+    ]
 
 
 @app.get("/api/trips/{trip_id}")
-async def get_trip(trip_id: UUID, user: dict = Depends(current_user)):
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(rest("trips"), headers=rest_headers(user), params={"id": f"eq.{trip_id}", "select": "*"})
-    if r.status_code >= 300 or not r.json():
+def get_trip(
+    trip_id: str,
+    user: dict = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    trip = db.query(TripModel).filter(TripModel.id == str(trip_id), TripModel.user_id == user["id"]).first()
+    if not trip:
         raise HTTPException(404, "Trip not found.")
-    return r.json()[0]
+    return {
+        "id": trip.id,
+        "destination": trip.destination,
+        "days": trip.days,
+        "preferences": trip.preferences,
+        "itinerary": trip.itinerary,
+        "created_at": trip.created_at.isoformat() if trip.created_at else None,
+        "updated_at": trip.updated_at.isoformat() if trip.updated_at else None,
+    }
 
 
 @app.put("/api/trips/{trip_id}")
-async def update_trip(trip_id: UUID, body: TripUpdate, user: dict = Depends(current_user)):
-    patch = {"itinerary": body.itinerary, "updated_at": datetime.now(timezone.utc).isoformat()}
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.patch(rest("trips"), headers=rest_headers(user), params={"id": f"eq.{trip_id}"}, json=patch)
-    if r.status_code >= 300 or not r.json():
+@app.patch("/api/trips/{trip_id}")
+def update_trip(
+    trip_id: str,
+    body: TripUpdate,
+    user: dict = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    trip = db.query(TripModel).filter(TripModel.id == str(trip_id), TripModel.user_id == user["id"]).first()
+    if not trip:
         raise HTTPException(404, "Trip not found.")
-    return r.json()[0]
+    trip.itinerary = body.itinerary
+    trip.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(trip)
+    return {
+        "id": trip.id,
+        "destination": trip.destination,
+        "days": trip.days,
+        "preferences": trip.preferences,
+        "itinerary": trip.itinerary,
+        "created_at": trip.created_at.isoformat() if trip.created_at else None,
+        "updated_at": trip.updated_at.isoformat() if trip.updated_at else None,
+    }
 
 
 @app.delete("/api/trips/{trip_id}", status_code=204)
-async def delete_trip(trip_id: UUID, user: dict = Depends(current_user)):
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.delete(rest("trips"), headers=rest_headers(user), params={"id": f"eq.{trip_id}"})
-    if r.status_code >= 300:
-        raise HTTPException(502, "Could not delete the trip.")
+def delete_trip(
+    trip_id: str,
+    user: dict = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    trip = db.query(TripModel).filter(TripModel.id == str(trip_id), TripModel.user_id == user["id"]).first()
+    if not trip:
+        raise HTTPException(404, "Trip not found.")
+    db.delete(trip)
+    db.commit()
     return Response(status_code=204)

@@ -1,19 +1,56 @@
-import { supabase } from './supabase';
-
 const BASE = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/$/, '');
 
-async function call(path, { method = 'GET', body } = {}) {
-  const { data } = await supabase.auth.getSession();
-  const token = data?.session?.access_token;
+export function getToken() {
+  try {
+    return localStorage.getItem('wayfare_token');
+  } catch {
+    return null;
+  }
+}
+
+export function setToken(token) {
+  try {
+    if (token) localStorage.setItem('wayfare_token', token);
+    else localStorage.removeItem('wayfare_token');
+  } catch { /* ignore */ }
+}
+
+export function getUser() {
+  try {
+    const raw = localStorage.getItem('wayfare_user');
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setUser(user) {
+  try {
+    if (user) localStorage.setItem('wayfare_user', JSON.stringify(user));
+    else localStorage.removeItem('wayfare_user');
+  } catch { /* ignore */ }
+}
+
+async function call(path, { method = 'GET', body, auth = true } = {}) {
+  const token = auth ? getToken() : null;
   let res;
   try {
     res = await fetch(BASE + path, {
       method,
-      headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
       body: body ? JSON.stringify(body) : undefined,
     });
   } catch {
     throw new Error('Cannot reach the server. Check your connection and try again.');
+  }
+  if (res.status === 401 && auth) {
+    setToken(null);
+    setUser(null);
+    window.dispatchEvent(new Event('wayfare_auth_expired'));
+    throw new Error('Your session has expired. Please sign in again.');
   }
   if (!res.ok) {
     let msg = 'Something went wrong. Please try again.';
@@ -27,6 +64,9 @@ async function call(path, { method = 'GET', body } = {}) {
 }
 
 export const api = {
+  signup: (email, password) => call('/api/auth/signup', { method: 'POST', body: { email, password }, auth: false }),
+  signin: (email, password) => call('/api/auth/signin', { method: 'POST', body: { email, password }, auth: false }),
+  me: () => call('/api/auth/me'),
   generate: (prefs) => call('/api/generate', { method: 'POST', body: prefs }),
   regenDay: (b) => call('/api/regenerate-day', { method: 'POST', body: b }),
   listTrips: () => call('/api/trips'),

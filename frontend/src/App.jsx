@@ -1,10 +1,9 @@
 import { useEffect, useState } from 'react';
-import { supabase } from './supabase';
-import { api } from './api';
+import { api, getToken, setToken, getUser, setUser } from './api';
 import Planner from './Planner.jsx';
 import Itinerary from './Itinerary.jsx';
 
-function Auth() {
+function Auth({ onAuthSuccess }) {
   const [mode, setMode] = useState('signin');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -16,19 +15,13 @@ function Auth() {
     setBusy(true);
     setMsg('');
     try {
-      const fn = mode === 'signin' ? supabase.auth.signInWithPassword : supabase.auth.signUp;
-      const { data, error } = await fn.call(supabase.auth, { email, password });
-      if (error) {
-        if (error.message === 'Failed to fetch') {
-          setMsg('Unable to reach Supabase. Please check that your Supabase project is active (not paused) and that VITE_SUPABASE_URL is correct.');
-        } else {
-          setMsg(error.message);
-        }
-      } else if (mode === 'signup' && !data?.session) {
-        setMsg('Account created. Check your email to confirm, then sign in.');
-      }
+      const fn = mode === 'signin' ? api.signin : api.signup;
+      const res = await fn(email, password);
+      setToken(res.access_token);
+      setUser(res.user);
+      onAuthSuccess(res.user);
     } catch (err) {
-      setMsg(err.message || 'An unexpected error occurred. Please try again.');
+      setMsg(err.message || 'Authentication failed. Please check your credentials.');
     } finally {
       setBusy(false);
     }
@@ -82,7 +75,7 @@ function TripList({ trips, loading, onOpen, onDelete, onNew }) {
 }
 
 export default function App() {
-  const [session, setSession] = useState(undefined);
+  const [user, setCurrentUser] = useState(() => (getToken() ? getUser() : null));
   const [view, setView] = useState('home'); // home | plan | trip
   const [trips, setTrips] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -90,12 +83,9 @@ export default function App() {
   const [toast, setToast] = useState('');
 
   useEffect(() => {
-    supabase.auth
-      .getSession()
-      .then(({ data }) => setSession(data?.session || null))
-      .catch(() => setSession(null));
-    const { data } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
-    return () => data?.subscription?.unsubscribe();
+    const handleExpired = () => setCurrentUser(null);
+    window.addEventListener('wayfare_auth_expired', handleExpired);
+    return () => window.removeEventListener('wayfare_auth_expired', handleExpired);
   }, []);
 
   const notify = (m) => { setToast(m); setTimeout(() => setToast(''), 3500); };
@@ -106,7 +96,14 @@ export default function App() {
     setLoading(false);
   }
 
-  useEffect(() => { if (session) refresh(); }, [session]);
+  useEffect(() => { if (user) refresh(); }, [user]);
+
+  function signOut() {
+    setToken(null);
+    setUser(null);
+    setCurrentUser(null);
+    setTrips([]);
+  }
 
   async function remove(t) {
     if (!confirm(`Delete "${t.itinerary?.title || t.destination}"?`)) return;
@@ -114,8 +111,7 @@ export default function App() {
     catch (e) { notify(e.message); }
   }
 
-  if (session === undefined) return <p className="muted center">Loading…</p>;
-  if (!session) return <Auth />;
+  if (!user) return <Auth onAuthSuccess={(u) => setCurrentUser(u)} />;
 
   return (
     <div className="shell">
@@ -123,7 +119,7 @@ export default function App() {
         <button className="brand" onClick={() => { setView('home'); refresh(); }}>Wayfare</button>
         <div className="top-actions">
           <button className="btn primary" onClick={() => setView('plan')}>New trip</button>
-          <button className="link" onClick={() => supabase.auth.signOut()}>Sign out</button>
+          <button className="link" onClick={signOut}>Sign out</button>
         </div>
       </header>
       <div className="page">
