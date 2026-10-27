@@ -25,6 +25,7 @@ app = FastAPI(title="Wayfare API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGINS,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -73,11 +74,14 @@ async def current_user(authorization: str = Header(default="")) -> dict:
         raise HTTPException(401, "Please sign in to continue.")
     if not SUPABASE_URL:
         raise HTTPException(500, "Server is missing SUPABASE_URL.")
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(
-            f"{SUPABASE_URL}/auth/v1/user",
-            headers={"Authorization": authorization, "apikey": SUPABASE_ANON_KEY},
-        )
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/auth/v1/user",
+                headers={"Authorization": authorization, "apikey": SUPABASE_ANON_KEY},
+            )
+    except httpx.RequestError:
+        raise HTTPException(502, "Cannot reach Supabase authentication service. Please check SUPABASE_URL.")
     if r.status_code != 200:
         raise HTTPException(401, "Your session has expired. Please sign in again.")
     return {"id": r.json()["id"], "token": authorization.split(" ", 1)[1]}

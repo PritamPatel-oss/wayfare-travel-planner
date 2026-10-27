@@ -15,11 +15,23 @@ function Auth() {
     e.preventDefault();
     setBusy(true);
     setMsg('');
-    const fn = mode === 'signin' ? supabase.auth.signInWithPassword : supabase.auth.signUp;
-    const { data, error } = await fn.call(supabase.auth, { email, password });
-    setBusy(false);
-    if (error) setMsg(error.message);
-    else if (mode === 'signup' && !data.session) setMsg('Account created. Check your email to confirm, then sign in.');
+    try {
+      const fn = mode === 'signin' ? supabase.auth.signInWithPassword : supabase.auth.signUp;
+      const { data, error } = await fn.call(supabase.auth, { email, password });
+      if (error) {
+        if (error.message === 'Failed to fetch') {
+          setMsg('Unable to reach Supabase. Please check that your Supabase project is active (not paused) and that VITE_SUPABASE_URL is correct.');
+        } else {
+          setMsg(error.message);
+        }
+      } else if (mode === 'signup' && !data?.session) {
+        setMsg('Account created. Check your email to confirm, then sign in.');
+      }
+    } catch (err) {
+      setMsg(err.message || 'An unexpected error occurred. Please try again.');
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
